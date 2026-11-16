@@ -36,6 +36,8 @@ Regras que valem explicar:
 - **Vitória e empate não têm mensagem.** Os dois lados aplicam as mesmas jogadas no mesmo tabuleiro e chegam ao mesmo resultado.
 - **Jogada validada.** Quem recebe confere o `gameId`, se é a vez do adversário, se `moveNumber` é o próximo da sequência e se a casa está livre; fora disso descarta.
 - **Pedidos cruzados.** Se os dois pedirem ao mesmo tempo (os dois clicam em Jogar de novo), vale o pedido de menor `gameId`.
+- **Reenvio.** O pedido de entrada e a última jogada são reenviados a cada 4 segundos enquanto a resposta não vem. Repetir não atrapalha: pedido repetido só recebe a resposta de novo, e jogada repetida é descartada pelo `moveNumber`. Isso cobre a mensagem que se perde quando a conexão TCP é fechada e reaberta no meio do caminho.
+- **Tolerância na presença.** A partida só é encerrada se o adversário ficar 20 segundos seguidos fora da lista de presença. Um sumiço curto não conta, porque a lista do núcleo pisca quando os relógios dos dois computadores diferem em mais de 15 segundos.
 
 ## Arquivos
 

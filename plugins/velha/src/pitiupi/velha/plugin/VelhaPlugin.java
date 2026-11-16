@@ -96,9 +96,17 @@ public class VelhaPlugin extends Plugin implements VelhaSender {
     /**
      * Para uma pessoa: TCP público do núcleo, fora da thread do Swing. Abrir a
      * conexão pode levar até 5 segundos e a janela não pode travar esperando.
+     *
+     * <p>Se o envio falhar, tenta mais uma vez antes de avisar: o núcleo fecha a
+     * conexão quando a pessoa pisca na lista de presença, e a segunda tentativa
+     * abre uma conexão nova.</p>
      */
     @Override
     public void send(VelhaMessage message, String ip, Runnable onFailure) {
+        sendTcp(message, ip, () -> sendTcp(message, ip, onFailure));
+    }
+
+    private void sendTcp(VelhaMessage message, String ip, Runnable onFailure) {
         connectionManager.sendTcpAsync(message, ip, new TcpAttemptListener() {
             @Override
             public void onConnecting(String endpoint) {

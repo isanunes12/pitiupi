@@ -63,6 +63,19 @@ public final class VelhaController {
     /** Sem anúncio por este tempo, a sala some da lista (o dono saiu ou o aviso de fechamento se perdeu). */
     public static final long ROOM_TIMEOUT_MS = 7000;
 
+    /**
+     * Quanto tempo seguido o adversário precisa ficar fora da lista de presença
+     * para a partida ser encerrada. Um sumiço curto não conta: a lista do núcleo
+     * pode piscar (por exemplo, quando os relógios dos dois computadores diferem).
+     */
+    public static final long PRESENCE_GRACE_MS = 20000;
+
+    /** De quantos em quantos {@link #tick()} uma mensagem sem confirmação é reenviada. */
+    private static final int RESEND_EVERY_TICKS = 2;
+
+    /** Quantas vezes a última jogada da partida é reenviada depois do fim. */
+    private static final int FINAL_MOVE_RESENDS = 3;
+
     private static final VelhaView NO_VIEW = new VelhaView() {
         @Override
         public void stateChanged() {
@@ -94,6 +107,12 @@ public final class VelhaController {
     private String notice = "";
     private boolean opponentSeenOnline;
     private boolean opponentGone;
+    /** Instante em que o adversário sumiu da lista de presença, ou -1 se ele está nela. */
+    private long opponentAbsentSince = -1;
+    /** Mensagem ainda sem confirmação de que chegou; é reenviada em {@link #tick()}. */
+    private VelhaMessage pending;
+    private int finalResendsLeft;
+    private int ticksSinceResend;
 
     /** Salas dos outros, na ordem em que apareceram, com o instante do último anúncio. */
     private final Map<String, Room> rooms = new LinkedHashMap<>();
@@ -161,7 +180,8 @@ public final class VelhaController {
         outcome = Outcome.NONE;
         phase = Phase.JOINING;
         notice = "";
-        send(new VelhaJoinMessage(gameId, localName.get(), localIp.get()), "pedido para entrar na sala");
+        pending = new VelhaJoinMessage(gameId, localName.get(), localIp.get());
+        send(pending, "pedido para entrar na sala");
         view.stateChanged();
     }
 
@@ -181,8 +201,9 @@ public final class VelhaController {
         }
         board.place(cell, myMark);
         myTurn = false;
-        send(new VelhaMoveMessage(gameId, localName.get(), localIp.get(), cell, board.count()),
-                "jogada " + board.count() + " na casa " + (cell + 1));
+        pending = new VelhaMoveMessage(gameId, localName.get(), localIp.get(), cell, board.count());
+        finalResendsLeft = FINAL_MOVE_RESENDS;
+        send(pending, "jogada " + board.count() + " na casa " + (cell + 1));
         checkEndOfGame();
         view.stateChanged();
     }
@@ -209,7 +230,8 @@ public final class VelhaController {
         outcome = Outcome.NONE;
         phase = Phase.JOINING;
         notice = "";
-        send(new VelhaJoinMessage(gameId, localName.get(), localIp.get()), "pedido para jogar de novo");
+        pending = new VelhaJoinMessage(gameId, localName.get(), localIp.get());
+        send(pending, "pedido para jogar de novo");
         view.stateChanged();
     }
 
@@ -246,7 +268,12 @@ public final class VelhaController {
         if (phase == Phase.HOSTING) {
             announceRoom(true);
         }
+        resendPending();
         long now = clock.getAsLong();
+        if (opponentAbsentSince >= 0 && now - opponentAbsentSince > PRESENCE_GRACE_MS) {
+            opponentAbsentSince = -1;
+            opponentLeftNetwork();
+        }
         boolean changed = false;
         Iterator<Map.Entry<String, Long>> it = roomLastSeen.entrySet().iterator();
         while (it.hasNext()) {
@@ -327,6 +354,12 @@ public final class VelhaController {
             view.opponentJoined(fromName);
             return;
         }
+        if (phase == Phase.PLAYING && msg.getGameId().equals(gameId) && fromIp.equals(opponentIp)) {
+            // Pedido repetido de quem já entrou: a resposta anterior pode ter se perdido. Responde de novo.
+            sender.send(new VelhaReplyMessage(gameId, localName.get(), localIp.get(), true, null), fromIp, () -> {
+            });
+            return;
+        }
         if (phase == Phase.FINISHED && !opponentGone && fromIp.equals(opponentIp)) {
             // O adversário quer jogar de novo e eu ainda estou na sala: começa outra partida.
             view.log("← " + fromName + ": pedido para jogar de novo [TCP]");
@@ -373,6 +406,7 @@ public final class VelhaController {
             startGame(Board.O);
             return;
         }
+        pending = null;
         view.log("← " + opponentName + ": entrada recusada [TCP]");
         String reason = msg.getReason();
         backToIdle(reason == null || reason.isBlank()
@@ -381,6 +415,11 @@ public final class VelhaController {
     }
 
     public void onMove(VelhaMoveMessage msg) {
+        if (phase == Phase.JOINING && sameGame(msg) && msg.getMoveNumber() == 1) {
+            // A primeira jogada do dono chegou antes da resposta (que se perdeu): fui aceito.
+            view.log("← " + opponentName + ": entrada aceita (pela primeira jogada) [TCP]");
+            startGame(Board.O);
+        }
         if (phase != Phase.PLAYING || !sameGame(msg) || myTurn) {
             return;
         }
@@ -390,6 +429,7 @@ public final class VelhaController {
         }
         board.place(msg.getCell(), opponentMark());
         myTurn = true;
+        pending = null; // a jogada do adversário prova que a minha anterior chegou
         view.log("← " + opponentName + ": jogada " + msg.getMoveNumber() + " na casa " + (msg.getCell() + 1)
                 + " [TCP]");
         checkEndOfGame();
@@ -418,8 +458,9 @@ public final class VelhaController {
     }
 
     /**
-     * A lista de presença mudou. Se o adversário estava na lista e sumiu
-     * (fechou o programa ou a rede caiu), encerra o que estava em andamento.
+     * A lista de presença mudou. Se o adversário estava na lista e sumiu, começa
+     * a contar o tempo; a partida só é encerrada se ele continuar fora por
+     * {@link #PRESENCE_GRACE_MS}.
      *
      * @param onlineIps IPs de quem está na lista agora.
      */
@@ -429,21 +470,28 @@ public final class VelhaController {
         }
         if (onlineIps.contains(opponentIp)) {
             opponentSeenOnline = true;
+            opponentAbsentSince = -1;
             return;
         }
-        if (!opponentSeenOnline || opponentGone) {
-            // O IP da mensagem pode não ser o mesmo da lista (máquina com duas placas):
-            // sem ter visto a pessoa na lista, não dá para concluir que ela saiu.
-            return;
+        // O IP da mensagem pode não ser o mesmo da lista (máquina com duas placas):
+        // sem ter visto a pessoa na lista, não dá para concluir que ela saiu.
+        if (opponentSeenOnline && !opponentGone && opponentAbsentSince < 0) {
+            // Só começa a contar. Quem decide é o tick(), depois de PRESENCE_GRACE_MS seguidos.
+            opponentAbsentSince = clock.getAsLong();
         }
+    }
+
+    private void opponentLeftNetwork() {
         if (phase == Phase.PLAYING) {
+            view.log("! " + opponentName + " está fora da lista de presença há mais de "
+                    + PRESENCE_GRACE_MS / 1000 + " s");
             finish(Outcome.OPPONENT_LEFT);
             opponentGone = true;
             view.stateChanged();
         } else if (phase == Phase.FINISHED) {
             opponentGone = true;
             view.stateChanged();
-        } else {
+        } else if (phase == Phase.JOINING) {
             backToIdle(opponentName + " saiu da rede.");
         }
     }
@@ -511,6 +559,31 @@ public final class VelhaController {
     // Interno
     // ------------------------------------------------------------------
 
+    /**
+     * Reenvia o pedido de entrada ou a última jogada enquanto a resposta não vem.
+     * Repetir não atrapalha: quem recebe um pedido repetido só responde de novo,
+     * e uma jogada repetida é descartada pelo número da jogada.
+     */
+    private void resendPending() {
+        if (pending == null || !sameGame(pending)) {
+            return;
+        }
+        if (++ticksSinceResend < RESEND_EVERY_TICKS) {
+            return;
+        }
+        ticksSinceResend = 0;
+        boolean waiting = phase == Phase.JOINING || (phase == Phase.PLAYING && !myTurn);
+        boolean lastMoveOfGame = phase == Phase.FINISHED && pending instanceof VelhaMoveMessage
+                && !opponentGone && finalResendsLeft > 0;
+        if (lastMoveOfGame) {
+            finalResendsLeft--;
+        }
+        if (waiting || lastMoveOfGame) {
+            sender.send(pending, opponentIp, () -> {
+            });
+        }
+    }
+
     private void announceRoom(boolean open) {
         sender.broadcast(new VelhaRoomMessage(gameId, localName.get(), localIp.get(), open));
     }
@@ -526,6 +599,7 @@ public final class VelhaController {
         myTurn = mark == Board.X;
         outcome = Outcome.NONE;
         opponentGone = false;
+        pending = null;
         phase = Phase.PLAYING;
         notice = "";
         view.stateChanged();
@@ -560,6 +634,8 @@ public final class VelhaController {
         gameId = null;
         myTurn = false;
         opponentGone = false;
+        opponentAbsentSince = -1;
+        pending = null;
         notice = message;
         view.stateChanged();
     }
@@ -569,6 +645,7 @@ public final class VelhaController {
         opponentIp = ip.trim();
         opponentSeenOnline = false;
         opponentGone = false;
+        opponentAbsentSince = -1;
         if (!opponentIp.equals(scoreIp)) {
             scoreIp = opponentIp;
             wins = 0;
